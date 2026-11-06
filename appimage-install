@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# appimage-install: install an AppImage the way Omarchy installs its own apps
+# (see /usr/bin/omarchy-install-t3code-app):
+#   - a stable, versionless home under ~/.local/share/<app>/, so an app that
+#     self-updates can replace its own file in place without breaking
+#     anything; the registered launcher keeps pointing at the right file
+#   - icon + .desktop extracted from the image, so it appears in and can be
+#     launched from the app launcher like any other app
+#
+# Usage:
+#   appimage-install [--copy] [path/to/AppImage]...
+#   appimage-install --remove <id>...
+#
+#   --copy        keep the original file instead of moving it
+#   --remove id   remove an app installed by this script (id is the desktop
+#                 entry's base name, e.g. "tradeskillmaster")
+#
+# With no paths given, picks up every *.AppImage in ~/Downloads.
+
+set -euo pipefail
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+APPS_DIR="$DATA/applications"
+ICONS_BASE="$DATA/icons"
+ICONS_DIR="$ICONS_BASE/hicolor"
+
+# Characters that would break the quoted Exec="..." we generate. Spaces are
+# fine because we quote; the others are not safe even quoted.
+exec_unsafe='[\"`$\\%]'
+
+usage() {
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+check_fuse() {
+  if ! pacman -Q fuse3 &>/dev/null; then
+    echo "Warning: fuse3 is not installed. Most AppImages need it to launch." >&2
+    echo "Run 'omarchy pkg add fuse3' first." >&2
+  fi
+}
+
+# Real AppImages are ELF binaries with "AI\x01" or "AI\x02" at bytes 8-9.
+is_appimage() {
+  [[ $(dd if="$1" bs=1 skip=8 count=2 2>/dev/null) == AI ]]
+}
+
+# "MyApp-1.2.3-rc1" -> "MyApp". A versionless name means a self-updater keeps
+# overwriting the same file, so the registered launcher stays valid.
+versionless() {
+  echo "$1" | sed -E 's/-[0-9][0-9]*(\.[0-9][0-9]*)*//g'
+}
+
+first_existing() {
+  local f
+  for f in "$@"; do
+    [[ -f $f ]] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+desktop_value() {
+  grep -m1 "^$1=" "$2" | sed "s/^$1=//" | tr -d '\r'
+}
+
+install_icons() {
+  local sq=$1 icon=$2 f rel
+  # Hicolor icons shipped by the app, with their size directories preserved:
+  # usr/share/icons/hicolor/256x256/apps/X.png -> icons/hicolor/256x256/apps.
+  while IFS= read -r f; do
+    rel=${f#"$sq/usr/share/icons/"}
+    install -Dm644 "$f" "$ICONS_BASE/$rel"
+  done < <(find "$sq/usr/share/icons" \( -name "$icon.png" -o -name "$icon.svg" \) 2>/dev/null)
+  # Fallback: icon sitting next to the .desktop at the image root.
+  for f in "$sq/$icon.png" "$sq/$icon.svg"; do
+    if [[ -f $f ]]; then
+      install -Dm644 "$f" "$ICONS_DIR/256x256/apps/${f##*/}"
+      return 0
+    fi
+  done
+}
+
+install_one() {
+  local src=$1 copy=$2
+
+  if [[ ! -f $src ]]; then
+    echo "Error: no such file: $src" >&2
+    return 1
+  fi
+  if [[ $src != *.AppImage ]]; then
+    echo "Error: not an AppImage: $src" >&2
+    return 1
+  fi
+  if ! is_appimage "$src"; then
+    echo "Error: not a valid AppImage (missing AppImage magic): $src" >&2
+    return 1
+  fi
+  if [[ $src =~ $exec_unsafe ]]; then
+    echo "Error: $src has characters a launcher Exec= cannot carry." >&2
+    echo "Move the file somewhere without them, e.g. ~/Applications." >&2
+    return 1
+  fi
+
+  local app_name
+  app_name=$(versionless "$(basename "${src%.AppImage}")")
+  local app_dir="$DATA/${app_name,,}"
+  local dest="$app_dir/$app_name.AppImage"
+  mkdir -p "$app_dir"
+
+  if [[ $copy == copy ]]; then
+    cp -f "$src" "$dest"
+  elif [[ $src != "$dest" ]]; then
+    mv -f "$src" "$dest"
+  fi
+  chmod 755 "$dest"
+
+  # Pull the .desktop entry (and the icon, below) out of the image itself.
+  local sq="$app_dir/.extract.$$"
+  mkdir -p "$sq"
+  if ! ( cd "$sq" && "$dest" --appimage-extract '*.desktop' &>/dev/null ); then
+    echo "Error: --appimage-extract failed on $dest." >&2
+    echo "(Very old type-1 AppImages without runtime extract are unsupported.)" >&2
+    rm -rf "$sq"
+    return 1
+  fi
+  ( cd "$sq" && "$dest" --appimage-extract 'usr/share/icons/hicolor/*/apps/*' &>/dev/null ) || true
+  ( cd "$sq" && "$dest" --appimage-extract '*.png' &>/dev/null ) || true
+
+  local desktop_src
+  desktop_src=$(first_existing "$sq"/squashfs-root/*.desktop \
+                               "$sq"/squashfs-root/usr/share/applications/*.desktop) || {
+    echo "Error: no .desktop entry inside image, cannot register: $dest" >&2
+    rm -rf "$sq"
+    return 1
+  }
+
+  local id
+  id=$(basename "$desktop_src" .desktop | tr ' ' '-')
+  local name icon_name orig_exec exec_args exec_path
+  name=$(echo "$(desktop_value Name "$desktop_src" || true)" | tr -d '|')
+  name=${name:-$id}
+  icon_name=$(echo "$(desktop_value Icon "$desktop_src" || true)" | tr -d '|')
+  icon_name=${icon_name:-$id}
+  icon_name=$(echo "$icon_name" | tr -d '/')
+
+  # Keep everything after the original binary ("AppRun"):
+  # e.g. the pattern "AppRun --no-sandbox %U" keeps --no-sandbox %U.
+  orig_exec=$(desktop_value Exec "$desktop_src")
+  if [[ $orig_exec == *' '* ]]; then
+    exec_args=" ${orig_exec#* }"
+  else
+    exec_args=" %U"
+  fi
+
+  install_icons "$sq/squashfs-root" "$icon_name" || \
+    echo "Warning: no usable icon found for '$name'." >&2
+  command -v gtk-update-icon-cache &>/dev/null && \
+    gtk-update-icon-cache -q "$ICONS_DIR" &>/dev/null || true
+
+  # % inside Exec= starts a field code, so any literal % in the path is %%.
+  exec_path=${dest//%/%%}
+
+  sed -e "s|^Exec=.*|Exec=\"$exec_path\"$exec_args|" \
+      -e "s|^Icon=.*|Icon=$icon_name|" \
+      -e "s|^Name=.*|Name=$name|" \
+      -e '/^X-AppImage-Version=/d' \
+      -e '/^Path=/d' \
+      "$desktop_src" >"$sq/entry.desktop"
+  printf 'TryExec=%s\n' "$dest" >>"$sq/entry.desktop"
+
+  install -Dm644 "$sq/entry.desktop" "$APPS_DIR/$id.desktop"
+  update-desktop-database "$APPS_DIR" &>/dev/null || true
+
+  rm -rf "$sq"
+  echo "Installed: $name"
+  echo "  Location: $dest"
+  echo "  Launch: it now shows up in the app launcher like every other app."
+  echo "  Updates: in-place (self-updates replace the AppImage at that path)."
+  [[ $copy == copy ]] && echo "  Original copy kept at: $src"
+  return 0
+}
+
+remove_one() {
+  local wanted=$1
+  local desktop id=$wanted
+  if [[ ! -f "$APPS_DIR/$wanted.desktop" ]]; then
+    # The id comes from the image's own .desktop name and often has
+    # capital letters (e.g. TradeSkillMaster), so match loosely first.
+    local match
+    match=$(find "$APPS_DIR" -maxdepth 1 -iname "$wanted.desktop" -printf '%f\n' 2>/dev/null | head -n1)
+    if [[ -n $match ]]; then
+      id=${match%.desktop}
+      echo "Matching launcher: $id"
+    else
+      echo "Error: no installed launcher named '$wanted'." >&2
+      return 1
+    fi
+  fi
+  desktop="$APPS_DIR/$id.desktop"
+  if [[ ! -f $desktop ]]; then
+    echo "Error: no installed launcher named '$id'." >&2
+    return 1
+  fi
+  local exec_path icon_name app_dir reply
+  # Exec was written quoted by this script; first quoted segment is the path.
+  exec_path=$(sed -n 's|^Exec="\([^"]*\)".*|\1|p' "$desktop")
+  icon_name=$(desktop_value Icon "$desktop" || true)
+  if [[ -z $exec_path ]]; then
+    echo "Error: cannot find the install path in $desktop." >&2
+    return 1
+  fi
+  app_dir=$(dirname "${exec_path//%%/%}")
+  if [[ ! $app_dir == "$DATA"/* ]]; then
+    echo "Error: refusing to remove outside $DATA for safety ('$id')." >&2
+    return 1
+  fi
+
+  read -r -p "Remove $app_dir and its launcher icon? [y/N] " reply
+  [[ $reply == [yY]* ]] || return 0
+  rm -rf "$app_dir"
+  rm -f "$desktop"
+  if [[ -n $icon_name ]]; then
+    find "$ICONS_BASE" \( -name "$icon_name.png" -o -name "$icon_name.svg" \) -delete 2>/dev/null || true
+    gtk-update-icon-cache -q "$ICONS_DIR" &>/dev/null || true
+  fi
+  update-desktop-database "$APPS_DIR" &>/dev/null || true
+  echo "Removed: $id"
+}
+
+mode=move
+remove=
+paths=()
+for arg in "$@"; do
+  case $arg in
+    --copy) mode=copy ;;
+    --remove) remove=1 ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *) paths+=("$arg") ;;
+  esac
+done
+
+if (( ${#paths[@]} == 0 )); then
+  # Nothing given explicitly: pick up whatever is in the usual place.
+  for f in "$HOME"/Downloads/*.AppImage; do
+    [[ -f $f ]] && paths+=("$f")
+  done
+fi
+(( ${#paths[@]} > 0 )) || { echo "Error: no AppImages found to operate on." >&2; usage; }
+
+failures=0
+if [[ $remove == 1 ]]; then
+  for p in "${paths[@]}"; do
+    remove_one "$p" || (( failures++ ))
+  done
+else
+  check_fuse
+  for p in "${paths[@]}"; do
+    install_one "$p" "$mode" || (( failures++ ))
+  done
+fi
+exit $failures
