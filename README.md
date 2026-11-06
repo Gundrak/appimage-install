@@ -27,8 +27,28 @@ registered desktop entry.
 
 ## Install
 
+**From GitHub, without cloning or downloading the repo** (the script is fully
+self-contained, so a single download is a complete install):
+
 ```bash
-# from this repo (the script lives here):
+mkdir -p ~/.local/bin
+curl -fsSL \
+  https://raw.githubusercontent.com/<your-user>/<repo>/main/appimage-install \
+  -o ~/.local/bin/appimage-install
+chmod +x ~/.local/bin/appimage-install
+```
+
+Pin to a tag or commit instead of `main` if you want a frozen version, e.g.
+`/<tag>/appimage-install`. To review the script before putting it on PATH,
+fetch it to a temp location and read it first:
+
+```bash
+curl -fsSL .../appimage-install -o /tmp/appimage-install && less /tmp/appimage-install
+```
+
+**From a local clone** (the script lives in the repo):
+
+```bash
 ln -s "$PWD/appimage-install" ~/.local/bin/appimage-install
 ```
 
@@ -90,6 +110,38 @@ when everything succeeded.
 - **`gtk-update-icon-cache` fails with "No theme index file":** the local
   hicolor tree needs an `index.theme`; copy one from the system:
   `cp /usr/share/icons/hicolor/index.theme ~/.local/share/icons/hicolor/`.
+
+### Removing installed apps (keep the tool)
+
+```bash
+appimage-install --remove <id>
+```
+
+Removes the app's directory under `~/.local/share/`, its launcher, and its
+icons, after a confirmation prompt. `--remove` is idempotent: re-running on
+an already-removed id returns an error.
+
+### Uninstalling `appimage-install` itself
+
+The tool is a single file (or a symlink) plus nothing else, so:
+
+```bash
+# installed from GitHub / copied file:
+rm ~/.local/bin/appimage-install
+
+# installed from a clone as a symlink:
+rm ~/.local/bin/appimage-install
+# (...the repo copy in the clone remains; delete the clone to fully remove it)
+```
+
+Optionally remove any apps it installed *first* (see above), since that uses
+the tool. Without it, an installed app can still be removed by hand:
+
+```bash
+rm -rf ~/.local/share/<app> ~/.local/share/applications/<App>.desktop
+find ~/.local/share/icons -name '<app-icon>.png' -o -name '<app-icon>.svg' -delete
+update-desktop-database ~/.local/share/applications
+```
 
 ## Tested with
 
