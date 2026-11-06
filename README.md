@@ -33,7 +33,7 @@ self-contained, so a single download is a complete install):
 ```bash
 mkdir -p ~/.local/bin
 curl -fsSL \
-  https://raw.githubusercontent.com/<your-user>/<repo>/main/appimage-install \
+  https://raw.githubusercontent.com/Gundrak/appimage-install/main/appimage-install \
   -o ~/.local/bin/appimage-install
 chmod +x ~/.local/bin/appimage-install
 ```
@@ -43,7 +43,9 @@ Pin to a tag or commit instead of `main` if you want a frozen version, e.g.
 fetch it to a temp location and read it first:
 
 ```bash
-curl -fsSL .../appimage-install -o /tmp/appimage-install && less /tmp/appimage-install
+curl -fsSL \
+  https://raw.githubusercontent.com/Gundrak/appimage-install/main/appimage-install \
+  -o /tmp/appimage-install && less /tmp/appimage-install
 ```
 
 **From a local clone** (the script lives in the repo):
